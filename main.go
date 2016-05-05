@@ -1,7 +1,8 @@
 package main
 
 import (
-	"crypto/rand"
+	"bytes"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 func main() {
 	run("http://shop.nordstrom.com/c/women")
+	run("http://shop.nordstrom.com/c/men")
 }
 
 func run(url string) {
@@ -31,26 +33,14 @@ func run(url string) {
 		os.Exit(1)
 	}
 
-	downloadImages := func(n *html.Node) bool {
-		if n.Type != html.ElementNode || n.Data != "img" {
-			return false
-		}
-		for _, a := range n.Attr {
-			if a.Key != "src" {
-				continue
-			}
-			u, err := resp.Request.URL.Parse(a.Val)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "downloadImages: %v\n", err)
-			}
-			name := downloadImage(u.String())
-			n.Data = name
-		}
-		return false
+	ih := &imageHelper{
+		baseURL:         resp.Request.URL,
+		urlToHash:       make(map[string]string, 20),
+		imageDownloaded: make(map[string]struct{}, 20),
 	}
 
-	node := getNodeById(doc, "main-content")
-	forEachNode(node, downloadImages)
+	node := getNodeByID(doc, "main-content")
+	forEachNode(node, ih.downloadImages)
 	forEachNode(node, stripCommentAndSpace)
 	html.Render(os.Stdout, node)
 }
@@ -69,6 +59,21 @@ func forEachNode(n *html.Node, f func(*html.Node) bool) {
 		forEachNode(c, f)
 		c = s
 	}
+}
+
+func getNodeByID(n *html.Node, id string) *html.Node {
+	var res *html.Node
+	filter := func(n *html.Node) bool {
+		for _, a := range n.Attr {
+			if a.Key == "id" && a.Val == id {
+				res = n
+				return true
+			}
+		}
+		return false
+	}
+	forEachNode(n, filter)
+	return res
 }
 
 func stripCommentAndSpace(n *html.Node) bool {
@@ -100,43 +105,75 @@ func stripCommentAndSpace(n *html.Node) bool {
 	}
 	return false
 }
-func getNodeById(n *html.Node, id string) *html.Node {
-	var res *html.Node
-	filter := func(n *html.Node) bool {
-		for _, a := range n.Attr {
-			if a.Key == "id" && a.Val == id {
-				res = n
-				return true
-			}
-		}
-		return false
-	}
-	forEachNode(n, filter)
-	return res
+
+type imageHelper struct {
+	baseURL         *url.URL
+	urlToHash       map[string]string
+	imageDownloaded map[string]struct{}
 }
 
-func downloadImage(imgURL string) string {
+func (ih *imageHelper) downloadImages(n *html.Node) bool {
+	if n.Type != html.ElementNode || n.Data != "img" {
+		return false
+	}
+	for _, a := range n.Attr {
+		if a.Key != "src" {
+			continue
+		}
+		u, err := ih.baseURL.Parse(a.Val)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "downloadImages: %v\n", err)
+			continue
+		}
+		name := ih.downloadImage(u.String())
+		n.Data = name
+	}
+	return false
+}
+
+func (ih *imageHelper) downloadImage(imgURL string) string {
+	// if we already downloaded an image from this url return the filename
+	if v, ok := ih.urlToHash[imgURL]; ok {
+		return v
+	}
+
 	u, err := url.Parse(imgURL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "downloadImage: %v\n")
+		fmt.Fprintf(os.Stderr, "downloadImage: %v\n", err)
+		return ""
 	}
 	ext := path.Ext(u.Path)
-	b := make([]byte, 8)
-	rand.Read(b)
-	name := fmt.Sprintf("%x%v", b, ext)
 
 	resp, err := http.Get(imgURL)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "downloadImage: %v\n")
+		fmt.Fprintf(os.Stderr, "downloadImage: %v\n", err)
+		return ""
 	}
 	defer resp.Body.Close()
 
-	f, err := os.Create(name)
+	// create a hash of the contents
+	h := sha1.New()
+	var buf bytes.Buffer
+	w := io.MultiWriter(h, &buf)
+	io.Copy(w, resp.Body)
+
+	// save url to hash mapping
+	filename := fmt.Sprintf("%x%v", h.Sum(nil), ext)
+	ih.urlToHash[imgURL] = filename
+
+	// if content was downloaded from a different url don't save a new file
+	if _, ok := ih.imageDownloaded[filename]; ok {
+		return filename
+	}
+
+	f, err := os.Create(filename)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "downloadImage: opening file: %v\n")
+		fmt.Fprintf(os.Stderr, "downloadImage: opening file: %v\n", err)
+		return ""
 	}
 	defer f.Close()
 
-	io.Copy(f, resp.Body)
-	return name
+	io.Copy(f, &buf)
+	ih.imageDownloaded[filename] = struct{}{}
+	return filename
 }
